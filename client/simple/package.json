@@ -23,6 +23,7 @@
     "not dead"
   ],
   "dependencies": {
+    "cytoscape": "^3.34.4",
     "ionicons": "^8.1.0",
     "normalize.css": "8.0.1",
     "ol": "^10.11.0",

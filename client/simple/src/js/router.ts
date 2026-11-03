@@ -20,7 +20,14 @@ ready(() => {
       where: [Endpoints.results]
     });
   });
-
+  // Load the graph renderer on a Graph View click, restricted to the results endpoint.
+  listen ("click", ".searxng_init_tracker_graph", function (this:HTMLElement,event: Event){
+    event.preventDefault();
+    load (()=> import("./plugin/TrackerGraph.ts").then(({default: Plugin})=> new Plugin()), {
+      on: "endpoint",
+      where: [Endpoints.results]
+    });
+  });
   if (settings.plugins?.includes("infiniteScroll")) {
     load(() => import("./plugin/InfiniteScroll.ts").then(({ default: Plugin }) => new Plugin()), {
       on: "endpoint",

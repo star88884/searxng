@@ -21,6 +21,7 @@
     "isEntry": true,
     "dynamicImports": [
       "src/js/plugin/MapView.ts",
+      "src/js/plugin/TrackerGraph.ts",
       "src/js/plugin/InfiniteScroll.ts",
       "src/js/plugin/Calculator.ts",
       "src/js/main/keyboard.ts",
@@ -112,6 +113,15 @@
     ],
     "css": [
       "sxng-mapview.min.css"
+    ]
+  },
+  "src/js/plugin/TrackerGraph.ts": {
+    "file": "chunk/B0PQhLka.min.js",
+    "name": "trackergraph",
+    "src": "src/js/plugin/TrackerGraph.ts",
+    "isDynamicEntry": true,
+    "imports": [
+      "_BuurKv-k.min.js"
     ]
   },
   "src/less/noscript.less": {

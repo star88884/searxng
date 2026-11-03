@@ -19,7 +19,12 @@
 {% endif %}
 
 <div id="results" class="{{ only_template }}">
+    <!-- The router handles this button; TrackerGraph renders the static sample in the container below. -->
+    <button type="button" class="searxng_init_tracker_graph">
+      Graph View
+    </button>
 
+    <div id="tracker-graph" style="width: 100%; height: 400px;"></div>
   {%- if answers -%}
     {%- include 'simple/elements/answers.html' -%}
   {%- endif %}
