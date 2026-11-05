@@ -1,0 +1,29 @@
+[
+  {
+    "data": {
+      "id": "alpha.example",
+      "label": "alpha.example"
+    }
+  },
+  {
+    "data": {
+      "id": "beta.example",
+      "label": "beta.example"
+    }
+  },
+  {
+    "data": {
+      "id": "gamma.example",
+      "label": "gamma.example"
+    }
+  },
+  {
+    "data": {
+      "source": "alpha.example",
+      "target": "beta.example",
+      "shared_trackers": [
+        "tracker-two.example"
+      ]
+    }
+  }
+]
