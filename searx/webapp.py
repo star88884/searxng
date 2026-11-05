@@ -118,6 +118,8 @@ from searx.valkeydb import initialize as valkey_initialize
 from searx.sxng_locales import sxng_locales
 import searx.search
 from searx.network import stream as http_stream
+from searx.plugins.tracker_lens import site_trackers
+from searx.tracker_graph import build_tracker_graph, format_for_cytoscape
 
 logger = logger.getChild('webapp')
 
@@ -148,6 +150,9 @@ app.jinja_env.trim_blocks = True
 app.jinja_env.lstrip_blocks = True
 app.jinja_env.add_extension('jinja2.ext.loopcontrols')  # pylint: disable=no-member
 app.jinja_env.filters['group_engines_in_tab'] = group_engines_in_tab  # pylint: disable=no-member
+app.jinja_env.filters['tracker_graph'] = (  # pylint: disable=no-member
+    lambda table: format_for_cytoscape(build_tracker_graph(site_trackers(table)))
+)
 app.secret_key = settings['server']['secret_key']
 
 

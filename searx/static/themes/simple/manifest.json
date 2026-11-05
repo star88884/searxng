@@ -116,7 +116,7 @@
     ]
   },
   "src/js/plugin/TrackerGraph.ts": {
-    "file": "chunk/B0PQhLka.min.js",
+    "file": "chunk/BVljOHPj.min.js",
     "name": "trackergraph",
     "src": "src/js/plugin/TrackerGraph.ts",
     "isDynamicEntry": true,

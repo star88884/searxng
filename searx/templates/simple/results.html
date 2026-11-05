@@ -19,12 +19,15 @@
 {% endif %}
 
 <div id="results" class="{{ only_template }}">
-    <!-- The router handles this button; TrackerGraph renders the static sample in the container below. -->
+    <!-- The router handles this button; TrackerGraph draws the embedded graph of this search in the container below. -->
     <button type="button" class="searxng_init_tracker_graph">
       Graph View
     </button>
 
     <div id="tracker-graph" style="width: 100%; height: 400px;"></div>
+    {%- if request.tracker_lens is defined %}
+    <script type="application/json" id="tracker-graph-data">{{ request.tracker_lens|tracker_graph|tojson }}</script>
+    {%- endif %}
   {%- if answers -%}
     {%- include 'simple/elements/answers.html' -%}
   {%- endif %}
