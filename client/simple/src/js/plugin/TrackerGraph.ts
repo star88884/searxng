@@ -43,15 +43,13 @@ export default class TrackerGraph extends Plugin {
             if (!container) {
                 return;
             }
-            const response= await fetch(
-                "/static/themes/simple/tracker_graph_sample.json"
-            );
+            const graphData= document.getElementById("tracker-graph-data");
 
-            if (!response.ok) {
-                throw new Error("Unable to load tracker graph data");
+            if (!graphData) {
+                throw new Error("Tracker graph data not found");
             }
-            const graphElements= await response.json();
 
+            const graphElements=JSON.parse(graphData.textContent || "[]");
 
             cytoscape ({
                 container: container,

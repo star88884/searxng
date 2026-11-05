@@ -54,6 +54,9 @@ from searx import (
     settings,
 )
 
+from searx.plugins.tracker_lens import site_trackers
+from searx.tracker_graph import build_tracker_graph, format_for_cytoscape
+
 from searx import infopage
 from searx import limiter
 from searx.botdetection import link_token, ProxyFix
@@ -773,6 +776,28 @@ def search():
     # search_query.lang contains the user choice (all, auto, en, ...)
     # when the user choice is "auto", search.search_query.lang contains the detected language
     # otherwise it is equals to search_query.lang
+    print("DEBUG Tracker Lens entries:",
+      len(getattr(sxng_request, "tracker_lens", {})),
+      flush=True)
+    tracker_reports = getattr(sxng_request, "tracker_lens", {})
+
+    print(
+    "DEBUG Successful tracker scans:",
+    sum(1 for report in tracker_reports.values() if report.fetched),
+    flush=True
+    )
+    
+    print(
+    "DEBUG Converted tracker sites:",
+    len(site_trackers(getattr(sxng_request, "tracker_lens", {}))),
+    flush=True
+    )
+    graph_data=build_tracker_graph(
+        site_trackers(getattr(sxng_request, "tracker_lens", {}))
+    )
+    graph_data=format_for_cytoscape(graph_data)
+    print("DEBUG Graph elements:", len(graph_data), flush=True)
+    print("DEBUG First graph element:", graph_data[:1], flush=True)
     return render(
         # fmt: off
         'results.html',
@@ -799,7 +824,8 @@ def search():
         ),
         timeout_limit = sxng_request.form.get('timeout_limit', None),
         timings = engine_timings_pairs,
-        max_response_time = max_response_time
+        max_response_time = max_response_time,
+        tracker_graph_data=graph_data,
         # fmt: on
     )
 

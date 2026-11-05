@@ -25,7 +25,8 @@
     </button>
 
     <div id="tracker-graph" style="width: 100%; height: 400px;"></div>
-  {%- if answers -%}
+    <script id="tracker-graph-data" type="application/json">{{tracker_graph_data | tojson}}</script>
+    {%- if answers -%}
     {%- include 'simple/elements/answers.html' -%}
   {%- endif %}
 
