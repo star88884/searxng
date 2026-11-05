@@ -53,6 +53,22 @@
   {%- if result.views %}<div class="result_views">{{ _('Views') }}: {{ result.views }}</div>{% endif -%}
   {%- if result.author %}<div class="result_author">{{ _('Author') }}: {{ result.author }}</div>{% endif -%}
   {%- if result.metadata %}<div class="highlight">{{ result.metadata }}</div>{% endif -%}
+  {#- tracker_lens badge and panel. EFFECTS: see searx/plugins/tracker_lens.py and spec.md. -#}
+  {%- set tl = request.tracker_lens.get(result.parsed_url.netloc ~ result.parsed_url.path)
+        if request.tracker_lens is defined and result.parsed_url else none -%}
+  {%- if tl -%}
+  <details class="tracker_lens">
+    <summary>
+      {%- if not tl.fetched -%}{{ _('trackers: not checked') }}
+      {%- elif tl.trackers|length == 0 -%}{{ _('no trackers found') }}
+      {%- else -%}{{ tl.trackers|length }} {{ _('trackers') }}{%- endif -%}
+    </summary>
+    {%- if tl.trackers -%}
+    <p>{{ _('Who is tracking you here') }}</p>
+    <ul>{% for host, owner, cats in tl.trackers %}<li>{{ host }}: {{ owner }} ({{ cats|join(', ') }})</li>{% endfor %}</ul>
+    {%- endif -%}
+  </details>
+  {%- endif -%}
 {%- endmacro -%}
 
 <!-- Draw result sub footer -->
