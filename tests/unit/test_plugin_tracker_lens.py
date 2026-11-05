@@ -4,6 +4,7 @@
 import concurrent.futures
 import json
 import pathlib
+import shutil
 import tempfile
 import threading
 import time
@@ -76,6 +77,7 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.addCleanup(mock.patch.stopall)
 
         self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def hostmap_file(self, text):
         path = self.tmp / "tracker_radar_hosts.json"
@@ -105,6 +107,11 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.assertFalse(self.plugin.init(self.app))
         self.assertEqual(tracker_lens.HOSTMAP, {})
 
+    def test_init_returns_false_when_hostmap_is_a_list(self):
+        self.hostmap_file(json.dumps(list(HOSTMAP.items())))
+        self.assertFalse(self.plugin.init(self.app))
+        self.assertEqual(tracker_lens.HOSTMAP, {})
+
     def test_init_loads_hostmap(self):
         self.hostmap_file(json.dumps(HOSTMAP))
         tracker_lens.HOSTMAP.clear()
@@ -113,6 +120,11 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.assertEqual(tracker_lens.CACHE, {})
         self.assertIsInstance(tracker_lens.POOL, concurrent.futures.ThreadPoolExecutor)
         self.addCleanup(tracker_lens.POOL.shutdown)
+
+    # registrable
+
+    def test_registrable_keeps_three_labels_for_second_level_suffix(self):
+        self.assertEqual(tracker_lens.registrable("www.bbc.co.uk"), "bbc.co.uk")
 
     # scan
 
@@ -124,6 +136,14 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.assertIs(tracker_lens.scan(PAGE_URL), report)
         self.get.assert_not_called()
 
+    def test_scan_refetches_expired_cache_entry(self):
+        with tracker_lens.LOCK:
+            tracker_lens.CACHE[PAGE_URL] = Report(False, [], 0, "timeout")
+            tracker_lens.STAMP[PAGE_URL] = time.monotonic() - tracker_lens.CACHE_TTL - 1
+        self.assertEqual(tracker_lens.scan(PAGE_URL), Report(True, PAGE_TRACKERS, 3, ""))
+        self.assertEqual(tracker_lens.CACHE[PAGE_URL], Report(True, PAGE_TRACKERS, 3, ""))
+        self.get.assert_called_once()
+
     def test_scan_unsafe_host_is_not_fetched(self):
         for url in ("http://127.0.0.1/admin", "http://10.0.0.8/", "http://169.254.169.254/latest", "http://[::1]/"):
             self.assertEqual(tracker_lens.scan(url), Report(False, [], 0, "unsafe host"))
@@ -132,10 +152,10 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
 
     def test_scan_timeout_gives_unfetched_report(self):
         self.get.side_effect = searx.network.Timeout("Timeout")
-        with self.app.test_request_context():
-            self.assertTrue(self.plugin.on_result(sxng_request, None, main_result(PAGE_URL)))
         self.assertEqual(tracker_lens.scan(PAGE_URL), Report(False, [], 0, "timeout"))
         self.assertEqual(tracker_lens.CACHE[PAGE_URL], Report(False, [], 0, "timeout"))
+        with self.app.test_request_context():
+            self.assertTrue(self.plugin.on_result(sxng_request, None, main_result(PAGE_URL)))
 
     def test_scan_connect_error_gives_unfetched_report(self):
         self.get.side_effect = ConnectionError("refused")
@@ -252,6 +272,16 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
             html = self.render(result)
         self.assertIn('<details class="tracker_lens">', html)
         self.assertIn("trackers: not checked", html)
+        self.assertNotIn("<p>", html)
+        self.assertNotIn("<li>", html)
+
+    def test_template_renders_no_trackers_found_without_panel(self):
+        result = main_result(PAGE_URL)
+        with self.app.test_request_context():
+            sxng_request.tracker_lens = {"www.augusta.edu/": Report(True, [], 0, "")}
+            html = self.render(result)
+        self.assertIn('<details class="tracker_lens">', html)
+        self.assertIn("no trackers found", html)
         self.assertNotIn("<p>", html)
         self.assertNotIn("<li>", html)
 

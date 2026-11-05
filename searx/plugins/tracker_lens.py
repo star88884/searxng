@@ -147,7 +147,9 @@ def _check_rep(table: dict[str, t.Any] | None = None) -> None:
     assert bool(HOSTMAP) == ACTIVE
     with LOCK:
         assert len(CACHE) <= CACHE_MAX
+        assert CACHE.keys() == STAMP.keys()
         sample = list(itertools.islice(CACHE.values(), 64))
+        values = list(table.values()) if table is not None else []
     for report in sample:
         assert isinstance(report, Report)
         if report.fetched:
@@ -156,9 +158,8 @@ def _check_rep(table: dict[str, t.Any] | None = None) -> None:
                 assert list(HOSTMAP[registrable(host)]) == [owner, cats]
         else:
             assert report.trackers == [] and report.error != ""
-    if table is not None:
-        for value in table.values():
-            assert isinstance(value, (concurrent.futures.Future, Report))
+    for value in values:
+        assert isinstance(value, (concurrent.futures.Future, Report))
 
 
 def registrable(host: str) -> str:
@@ -171,6 +172,12 @@ def registrable(host: str) -> str:
        "googleapis.com".
     HELPS: scan(url)
     """
+    host = host.rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
     labels = host.split(".")
     n = 3 if ".".join(labels[-2:]) in SECOND_LEVEL else 2
     return ".".join(labels[-n:])
@@ -203,6 +210,7 @@ class _SrcParser(html.parser.HTMLParser):
             for name, value in attrs:
                 if name == "src" and value:
                     self.srcs.append(value)
+                    break
 
 
 def _unsafe(host: str) -> bool:
@@ -212,7 +220,7 @@ def _unsafe(host: str) -> bool:
     HELPS: scan(url)
     """
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(host.split("%")[0])
     except ValueError:
         return False
     return ip.is_loopback or ip.is_link_local or ip.is_private
@@ -222,7 +230,8 @@ def _third_party_hosts(url: str, body: str) -> set[str]:
     """
     EFFECTS: Returns the set H of the module OVERVIEW for url and body: the host of
        every script and iframe src in body, resolved against url, whose registrable
-       domain differs from that of url. A src that resolves to no host is left out.
+       domain differs from that of url. A src that resolves to no host, or to a
+       scheme other than http or https, is left out.
     HELPS: scan(url)
     """
     parser = _SrcParser()
@@ -232,10 +241,11 @@ def _third_party_hosts(url: str, body: str) -> set[str]:
     hosts: set[str] = set()
     for src in parser.srcs:
         try:
-            host = urlsplit(urljoin(url, src.strip())).hostname
+            parts = urlsplit(urljoin(url, src.strip()))
         except ValueError:
             continue
-        if host and registrable(host) != own:
+        host = (parts.hostname or "").rstrip(".")
+        if parts.scheme in ("http", "https") and host and registrable(host) != own:
             hosts.add(host)
     return hosts
 
@@ -244,7 +254,7 @@ def scan(url: str) -> Report:
     """
     REQUIRES: url is an absolute http or https URL as normalized by
        Result.normalize_result_fields(); HOSTMAP is loaded (init returned true).
-    MODIFIES: CACHE
+    MODIFIES: CACHE, STAMP
     EFFECTS: If url is in CACHE and its entry is younger than CACHE_TTL, returns that
        Report and fetches nothing. Else:
        if the host of url is an IP literal in a loopback, link-local or private range,
@@ -286,19 +296,16 @@ def scan(url: str) -> Report:
     """
     with LOCK:
         cached = CACHE.get(url)
-        if cached is not None and time.monotonic() - STAMP[url] < CACHE_TTL:
-            return cached
-    host = urlsplit(url).hostname or ""
-    if _unsafe(host):
-        r = Report(False, [], 0, "unsafe host")
-    else:
-        try:
-            resp = searx.network.get(url, timeout=FETCH_TIMEOUT, allow_redirects=True, raise_for_httperror=False)
-        except searx.network.Timeout:
-            r = Report(False, [], 0, "timeout")
-        except Exception:  # pylint: disable=broad-except
-            r = Report(False, [], 0, "connect")
+        if cached is not None and time.monotonic() - STAMP[url] >= CACHE_TTL:
+            cached = None
+    if cached is not None:
+        _check_rep()
+        return cached
+    try:
+        if _unsafe(urlsplit(url).hostname or ""):
+            r = Report(False, [], 0, "unsafe host")
         else:
+            resp = searx.network.get(url, timeout=FETCH_TIMEOUT, allow_redirects=True, raise_for_httperror=False)
             content_type = resp.headers.get("content-type", "")
             if not 200 <= resp.status_code < 300:
                 r = Report(False, [], 0, f"http {resp.status_code}")
@@ -307,7 +314,7 @@ def scan(url: str) -> Report:
             else:
                 body = resp.text[:MAX_BYTES]
                 # //{body is the head of an html page that answered 2xx}
-                assert 200 <= resp.status_code < 300 and "html" in content_type.lower()
+                assert 200 <= resp.status_code < 300 and "html" in content_type.lower() and len(body) <= MAX_BYTES
                 hosts = _third_party_hosts(url, body)
                 trackers = [
                     (x, HOSTMAP[registrable(x)][0], HOSTMAP[registrable(x)][1])
@@ -315,6 +322,12 @@ def scan(url: str) -> Report:
                     if registrable(x) in HOSTMAP
                 ]
                 r = Report(True, trackers, len(hosts), "")
+    except searx.network.Timeout:
+        r = Report(False, [], 0, "timeout")
+    except AssertionError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        r = Report(False, [], 0, "connect")
     # //{r.fetched implies (A (x,o,c) : (x,o,c) in r.trackers : (o,c) = HOSTMAP[registrable(x)])}
     assert not r.fetched or all(list(HOSTMAP[registrable(x)]) == [o, c] for x, o, c in r.trackers)
     with LOCK:
@@ -369,7 +382,7 @@ class SXNGPlugin(Plugin):
 
     def init(self, app: "flask.Flask") -> bool:
         """
-        MODIFIES: HOSTMAP, CACHE, POOL
+        MODIFIES: HOSTMAP, CACHE, STAMP, POOL, ACTIVE
         EFFECTS: If searx/data/tracker_radar_hosts.json cannot be read, cannot be
            parsed, or holds no entries, logs the reason and returns false, so
            PluginStorage removes the plugin and SearXNG runs exactly as before (no
@@ -389,9 +402,15 @@ class SXNGPlugin(Plugin):
         global POOL, ACTIVE
         ACTIVE = False
         HOSTMAP.clear()
+        with LOCK:
+            CACHE.clear()
+            STAMP.clear()
         try:
             with HOSTMAP_FILE.open(encoding="utf-8") as f:
-                HOSTMAP.update(json.load(f))
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise TypeError("not a JSON object")
+            HOSTMAP.update(data)
         except (OSError, ValueError, TypeError) as exc:
             HOSTMAP.clear()
             self.log.error("tracker lens is off, host map %s: %s", HOSTMAP_FILE, exc)
@@ -403,9 +422,6 @@ class SXNGPlugin(Plugin):
             return False
         # //{HOSTMAP != {}}
         assert HOSTMAP
-        with LOCK:
-            CACHE.clear()
-            STAMP.clear()
         if POOL is not None:
             POOL.shutdown(wait=False)
         POOL = concurrent.futures.ThreadPoolExecutor(POOL_SIZE, thread_name_prefix="tracker_lens")
@@ -423,7 +439,8 @@ class SXNGPlugin(Plugin):
            (through scan, later, in a worker)
         EFFECTS: If result.url is None (answers, suggestions, corrections, infoboxes
            and engine_data items can have no url) or result.parsed_url.scheme is not
-           http or https, returns true and changes nothing. Else let k = key(result):
+           http or https or result.parsed_url has no host, returns true and changes
+           nothing. Else let k = key(result):
            if request has no tracker_lens attribute, sets request.tracker_lens := {};
            if k is not in request.tracker_lens, sets request.tracker_lens[k] := the
            Future of scan(result.url) submitted to POOL; otherwise changes nothing
@@ -431,7 +448,8 @@ class SXNGPlugin(Plugin):
            Returns true in every case: the lens never drops a result and never
            changes one. Does not wait for the scan. Never raises.
         IMPL SKETCH:
-           if result.url = null or result.parsed_url.scheme notin {http, https} then return true
+           if result.url = null or result.parsed_url.scheme notin {http, https}
+              or result.parsed_url has no host then return true
            //{result.url is an absolute http(s) url}
            k := key(result)
            with LOCK:
@@ -446,11 +464,12 @@ class SXNGPlugin(Plugin):
         """
         url = getattr(result, "url", None)
         parsed_url = getattr(result, "parsed_url", None)
-        if url is None or parsed_url is None or parsed_url.scheme not in ("http", "https"):
+        if url is None or parsed_url is None or parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
             return True
         # //{result.url is an absolute http(s) url}
         assert parsed_url.scheme in ("http", "https") and parsed_url.netloc
         k = key(result)
+        assert POOL is not None  # REQUIRES: init(app) returned true
         with LOCK:
             table = getattr(request, "tracker_lens", None)
             if table is None:
@@ -458,7 +477,8 @@ class SXNGPlugin(Plugin):
                 request.tracker_lens = table
             if k not in table:
                 table[k] = POOL.submit(scan, url)
-        # //{k in request.tracker_lens /\ (a Future there means a scan of that page is queued or running)}
+        # //{k in request.tracker_lens
+        #    /\ (request.tracker_lens[k] is a Future => a scan of that page is queued or running)}
         assert k in request.tracker_lens
         return True
 
@@ -489,16 +509,17 @@ class SXNGPlugin(Plugin):
         """
         table = getattr(request, "tracker_lens", None)
         if table is None:
+            _check_rep()
             return None
         deadline = time.monotonic() + BUDGET
         with LOCK:
-            items = list(table.items())
-        pending = [f for _, f in items if isinstance(f, concurrent.futures.Future)]
+            pending = [f for f in table.values() if isinstance(f, concurrent.futures.Future)]
         concurrent.futures.wait(pending, timeout=max(0.0, deadline - time.monotonic()))
-        for k, f in items:
-            if isinstance(f, concurrent.futures.Future):
-                table[k] = f.result() if f.done() else Report(False, [], 0, "timeout")
-        # //{(A k : k in request.tracker_lens : request.tracker_lens[k] is a Report)}
-        assert all(isinstance(v, Report) for v in table.values())
+        with LOCK:
+            for k, f in list(table.items()):
+                if isinstance(f, concurrent.futures.Future):
+                    table[k] = f.result() if f.done() else Report(False, [], 0, "timeout")
+            # //{(A k : k in request.tracker_lens : request.tracker_lens[k] is a Report)}
+            assert all(isinstance(v, Report) for v in table.values())
         _check_rep(table)
         return None
