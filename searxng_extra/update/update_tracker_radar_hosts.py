@@ -39,7 +39,7 @@ DOMAINS_DIR = Path('domains') / 'US'
 
 def sparse_checkout(target: Path) -> Path:
     """EFFECTS: Checks out only ``domains/US`` of Tracker Radar below target
-    and returns that directory."""
+    and returns the repository directory."""
     repo = target / 'tracker-radar'
     subprocess.run(
         ['git', 'clone', '--filter=blob:none', '--no-checkout', '--depth', '1', REPO_URL, str(repo)],
