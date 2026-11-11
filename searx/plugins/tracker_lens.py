@@ -446,6 +446,7 @@ def _fetch(url: str) -> tuple[str, str, t.Any]:
         #          sent it.
         p = urljoin(p, location)
     # //{MAX_REDIRECTS + 1 hops were fetched and every answer was a redirect}
+    assert resp.status_code in (301, 302, 303, 307, 308) and location
 
     # CS1.6.6: Reached only when every one of the MAX_REDIRECTS + 1 answers was a redirect. p is the
     #          next hop, which is not fetched.
