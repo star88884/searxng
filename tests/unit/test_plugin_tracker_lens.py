@@ -5,12 +5,14 @@ import concurrent.futures
 import json
 import pathlib
 import shutil
+import socket
 import tempfile
 import threading
 import time
 from unittest import mock
 
 import flask
+from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 
 import searx.network
 import searx.plugins
@@ -44,8 +46,15 @@ PAGE_TRACKERS = [
 MACRO = "{% from 'simple/macros.html' import result_sub_header with context %}{{ result_sub_header(result) }}"
 
 
-def response(status=200, content_type="text/html; charset=utf-8", text=PAGE):
-    return mock.Mock(status_code=status, headers={"content-type": content_type}, text=text)
+PUBLIC_ADDRESS = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+PRIVATE_ADDRESS = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+
+
+def response(status=200, content_type="text/html; charset=utf-8", text=PAGE, location=None):
+    headers = {"content-type": content_type}
+    if location is not None:
+        headers["location"] = location
+    return mock.Mock(status_code=status, headers=headers, text=text)
 
 
 def main_result(url):
@@ -74,6 +83,7 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.addCleanup(tracker_lens.POOL.shutdown)
 
         self.get = mock.patch("searx.network.get", return_value=response()).start()
+        self.getaddrinfo = mock.patch("socket.getaddrinfo", return_value=PUBLIC_ADDRESS).start()
         self.addCleanup(mock.patch.stopall)
 
         self.tmp = pathlib.Path(tempfile.mkdtemp())
@@ -111,6 +121,12 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.hostmap_file(json.dumps(list(HOSTMAP.items())))
         self.assertFalse(self.plugin.init(self.app))
         self.assertEqual(tracker_lens.HOSTMAP, {})
+
+    def test_init_returns_false_when_hostmap_entry_malformed(self):
+        for value in ("Google", ["Google"], [1, ["Analytics"]], ["Google", ["Analytics", 2]]):
+            self.hostmap_file(json.dumps({**HOSTMAP, "bad.example": value}))
+            self.assertFalse(self.plugin.init(self.app))
+            self.assertEqual(tracker_lens.HOSTMAP, {})
 
     def test_init_loads_hostmap(self):
         self.hostmap_file(json.dumps(HOSTMAP))
@@ -150,6 +166,51 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
             self.assertEqual(tracker_lens.CACHE[url], Report(False, [], 0, "unsafe host"))
         self.get.assert_not_called()
 
+    def test_scan_localhost_is_unsafe_and_not_fetched(self):
+        for url in ("http://localhost/admin", "http://LOCALHOST:8888/", "http://db.localhost/", "http://localhost./"):
+            self.assertEqual(tracker_lens.scan(url), Report(False, [], 0, "unsafe host"))
+        self.get.assert_not_called()
+        self.getaddrinfo.assert_not_called()
+
+    def test_scan_name_resolving_to_private_address_is_unsafe(self):
+        self.getaddrinfo.return_value = PUBLIC_ADDRESS + PRIVATE_ADDRESS
+        self.assertEqual(tracker_lens.scan("https://intranet.example/"), Report(False, [], 0, "unsafe host"))
+        self.assertEqual(tracker_lens.CACHE["https://intranet.example/"], Report(False, [], 0, "unsafe host"))
+        self.getaddrinfo.assert_called_once_with("intranet.example", None)
+        self.get.assert_not_called()
+
+    def test_scan_unresolvable_name_is_connect_and_not_fetched(self):
+        self.getaddrinfo.side_effect = socket.gaierror(8, "nodename nor servname provided, or not known")
+        self.assertEqual(tracker_lens.scan("https://no-such-name.example/"), Report(False, [], 0, "connect"))
+        self.get.assert_not_called()
+
+    def test_scan_redirect_to_link_local_address_is_unsafe(self):
+        for location in ("http://169.254.169.254/latest/meta-data/", "file:///etc/passwd"):
+            self.get.reset_mock()
+            self.get.return_value = response(status=302, location=location)
+            url = "https://public.example/?to=" + location
+            self.assertEqual(tracker_lens.scan(url), Report(False, [], 0, "unsafe host"))
+            self.get.assert_called_once()
+
+    def test_scan_four_redirects_gives_redirects(self):
+        self.get.side_effect = [response(status=301, location=f"https://hop{i}.example/") for i in range(1, 6)]
+        self.assertEqual(tracker_lens.scan("https://hop0.example/"), Report(False, [], 0, "redirects"))
+        self.assertEqual(tracker_lens.CACHE["https://hop0.example/"], Report(False, [], 0, "redirects"))
+        self.assertEqual(
+            [call.args[0] for call in self.get.call_args_list],
+            [f"https://hop{i}.example/" for i in range(tracker_lens.MAX_REDIRECTS + 1)],
+        )
+
+    def test_scan_one_redirect_still_scans(self):
+        page = PAGE.replace("</head>", '<script src="https://static.augusta.edu/app.js"></script></head>')
+        self.get.side_effect = [response(status=301, location=PAGE_URL), response(text=page)]
+        self.assertEqual(tracker_lens.scan("https://short.example/a"), Report(True, PAGE_TRACKERS, 3, ""))
+        self.assertEqual(tracker_lens.CACHE["https://short.example/a"], Report(True, PAGE_TRACKERS, 3, ""))
+        self.assertEqual([call.args[0] for call in self.get.call_args_list], ["https://short.example/a", PAGE_URL])
+        self.assertEqual(
+            [call.args[0] for call in self.getaddrinfo.call_args_list], ["short.example", "www.augusta.edu"]
+        )
+
     def test_scan_timeout_gives_unfetched_report(self):
         self.get.side_effect = searx.network.Timeout("Timeout")
         self.assertEqual(tracker_lens.scan(PAGE_URL), Report(False, [], 0, "timeout"))
@@ -158,9 +219,19 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
             self.assertTrue(self.plugin.on_result(sxng_request, None, main_result(PAGE_URL)))
 
     def test_scan_connect_error_gives_unfetched_report(self):
-        self.get.side_effect = ConnectionError("refused")
-        self.assertEqual(tracker_lens.scan(PAGE_URL), Report(False, [], 0, "connect"))
+        self.get.side_effect = CurlConnectionError("refused")
+        with self.assertNoLogs("searx.plugins.tracker_lens", level="ERROR"):
+            self.assertEqual(tracker_lens.scan(PAGE_URL), Report(False, [], 0, "connect"))
         self.assertEqual(tracker_lens.CACHE[PAGE_URL], Report(False, [], 0, "connect"))
+
+    def test_scan_other_exception_is_error_and_logged(self):
+        self.get.side_effect = RuntimeError("parser bug")
+        with self.assertLogs("searx.plugins.tracker_lens", level="ERROR") as logs:
+            self.assertEqual(tracker_lens.scan(PAGE_URL), Report(False, [], 0, "error"))
+        self.assertEqual(tracker_lens.CACHE[PAGE_URL], Report(False, [], 0, "error"))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(PAGE_URL, logs.output[0])
+        self.assertIn("parser bug", logs.output[0])
 
     def test_scan_bad_status_gives_unfetched_report(self):
         self.get.return_value = response(status=404)
@@ -175,7 +246,7 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.assertEqual(report, Report(True, PAGE_TRACKERS, 3, ""))
         self.assertEqual(tracker_lens.CACHE[PAGE_URL], report)
         self.get.assert_called_once_with(
-            PAGE_URL, timeout=tracker_lens.FETCH_TIMEOUT, allow_redirects=True, raise_for_httperror=False
+            PAGE_URL, timeout=tracker_lens.FETCH_TIMEOUT, allow_redirects=False, raise_for_httperror=False
         )
 
     def test_scan_evicts_oldest_when_full(self):
@@ -241,6 +312,17 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
             self.assertIsNone(self.plugin.post_search(sxng_request, None))
             self.assertEqual(sxng_request.tracker_lens, {"www.augusta.edu/": report})
 
+    def test_post_search_turns_raised_scan_into_error(self):
+        raised = concurrent.futures.Future()
+        raised.set_exception(AssertionError("broken invariant"))
+        with self.app.test_request_context():
+            sxng_request.tracker_lens = {"www.augusta.edu/": raised}
+            with self.assertLogs("searx.plugins.tracker_lens", level="ERROR") as logs:
+                self.assertIsNone(self.plugin.post_search(sxng_request, None))
+            self.assertEqual(sxng_request.tracker_lens, {"www.augusta.edu/": Report(False, [], 0, "error")})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("www.augusta.edu/", logs.output[0])
+
     def test_post_search_marks_unfinished_as_timeout(self):
         release = threading.Event()
         self.addCleanup(release.set)
@@ -275,13 +357,13 @@ class PluginTrackerLensTest(SearxTestCase):  # pylint: disable=too-many-public-m
         self.assertNotIn("<p>", html)
         self.assertNotIn("<li>", html)
 
-    def test_template_renders_no_trackers_found_without_panel(self):
+    def test_template_renders_no_known_trackers_without_panel(self):
         result = main_result(PAGE_URL)
         with self.app.test_request_context():
             sxng_request.tracker_lens = {"www.augusta.edu/": Report(True, [], 0, "")}
             html = self.render(result)
         self.assertIn('<details class="tracker_lens">', html)
-        self.assertIn("no trackers found", html)
+        self.assertIn("no known trackers in the page HTML", html)
         self.assertNotIn("<p>", html)
         self.assertNotIn("<li>", html)
 

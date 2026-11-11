@@ -30,10 +30,10 @@ A Report is a record (fetched, trackers, third_party, error):
    trackers    list of (host, owner, categories): the third-party script and iframe
                hosts of the page whose registrable domain is in HOSTMAP
    third_party number of distinct third-party hosts seen, matched or not
-   error       "" when fetched, else one of "unsafe host", "timeout", "connect",
-               "http <status>", "not html"
-Constants: FETCH_TIMEOUT = 1.5 s, MAX_BYTES = 262144, BUDGET = 1.5 s, POOL_SIZE = 1,
-   CACHE_MAX = 2048, CACHE_TTL = 3600 s.
+   error       "" when fetched, else one of "unsafe host", "redirects", "timeout",
+               "connect", "http <status>", "not html", "error"
+Constants: FETCH_TIMEOUT = 1.5 s, MAX_BYTES = 262144, MAX_REDIRECTS = 3, BUDGET = 1.5 s,
+   POOL_SIZE = 1, CACHE_MAX = 2048, CACHE_TTL = 3600 s.
 The plugin never drops a result and never changes one. Its only output is the
 table the template reads to draw a badge and a panel on each result card.
 It extends SearXNG's tracker_url_remover (searx/data/tracker_patterns.py), which
@@ -59,11 +59,14 @@ import html.parser
 import ipaddress
 import itertools
 import json
+import logging
+import socket
 import threading
 import time
 import typing as t
 from urllib.parse import urljoin, urlsplit
 
+from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
 from flask_babel import gettext  # pyright: ignore[reportUnknownVariableType]
 
 import searx.network
@@ -80,6 +83,7 @@ if t.TYPE_CHECKING:
 
 FETCH_TIMEOUT = 1.5
 MAX_BYTES = 262144
+MAX_REDIRECTS = 3
 BUDGET = 1.5
 POOL_SIZE = 1
 CACHE_MAX = 2048
@@ -122,6 +126,8 @@ POOL: concurrent.futures.ThreadPoolExecutor | None = None
 LOCK = threading.Lock()
 ACTIVE = False
 """What init(app) returned."""
+
+log = logging.getLogger("searx.plugins.tracker_lens")
 
 
 class Report(t.NamedTuple):
@@ -215,15 +221,27 @@ class _SrcParser(html.parser.HTMLParser):
 
 def _unsafe(host: str) -> bool:
     """
-    EFFECTS: Returns true iff host is an IP literal in a loopback, link-local or
-       private range.
-    HELPS: scan(url)
+    REQUIRES: host is a lower-case host name or IP literal without a port.
+    EFFECTS: Returns true iff host is localhost or a name under .localhost, or is an
+       IP literal that is, or a name that resolves (system resolver,
+       socket.getaddrinfo) to at least one address that is, loopback, private,
+       link-local, reserved, multicast or unspecified. Such a host points into the
+       server's own machine or network, and the lens must not fetch it on a
+       user's behalf. Raises socket.gaierror when host is a name that does not
+       resolve.
+    HELPS: _fetch(url)
     """
+    host = host.rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
     try:
-        ip = ipaddress.ip_address(host.split("%")[0])
+        ips = [ipaddress.ip_address(host.split("%")[0])]
     except ValueError:
-        return False
-    return ip.is_loopback or ip.is_link_local or ip.is_private
+        ips = [ipaddress.ip_address(info[4][0].split("%")[0]) for info in socket.getaddrinfo(host, None)]
+    return any(
+        ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        for ip in ips
+    )
 
 
 def _third_party_hosts(url: str, body: str) -> set[str]:
@@ -250,45 +268,102 @@ def _third_party_hosts(url: str, body: str) -> set[str]:
     return hosts
 
 
+def _fetch(url: str) -> tuple[str, str, t.Any]:
+    """
+    REQUIRES: url is an absolute URL.
+    EFFECTS: Asks for the page at url and follows its redirects by hand, at most
+       MAX_REDIRECTS of them. A hop is one URL of that chain: url first, then the
+       Location of each redirect answer (status 301, 302, 303, 307 or 308),
+       resolved against the hop that sent it. Returns (error, p, resp):
+       ("unsafe host", p, None) if hop p is not an http or https URL or
+          _unsafe(host(p)); p is not fetched, and no later hop is;
+       ("redirects", p, None) if MAX_REDIRECTS redirects were followed and the
+          answer of the last one is again a redirect, to p;
+       ("", p, resp) otherwise, where resp is the first answer that is not a
+          redirect and p is the hop that gave it.
+       Each hop is one GET that waits at most FETCH_TIMEOUT seconds. Raises what
+       searx.network.get and _unsafe raise.
+    IMPL SKETCH:
+       p := url
+       repeat MAX_REDIRECTS + 1 times:
+          if scheme(p) notin {http, https} or _unsafe(host(p)) then
+             return ("unsafe host", p, null)
+          //{p is an http(s) URL whose host passed the unsafe-host check}
+          resp := searx.network.get(p, timeout := FETCH_TIMEOUT, allow_redirects := false,
+                                    raise_for_httperror := false)
+          if resp is not a redirect with a Location then return ("", p, resp)
+          p := urljoin(p, resp.Location)
+       //{MAX_REDIRECTS + 1 hops were fetched and every answer was a redirect}
+       return ("redirects", p, null)
+    HELPS: scan(url)
+    """
+    p = url
+    for _ in range(MAX_REDIRECTS + 1):
+        parts = urlsplit(p)
+        if parts.scheme not in ("http", "https") or _unsafe(parts.hostname or ""):
+            return "unsafe host", p, None
+        # //{p is an http(s) URL whose host passed the unsafe-host check}
+        assert parts.scheme in ("http", "https")
+        resp = searx.network.get(p, timeout=FETCH_TIMEOUT, allow_redirects=False, raise_for_httperror=False)
+        location = resp.headers.get("location")
+        if resp.status_code not in (301, 302, 303, 307, 308) or not location:
+            return "", p, resp
+        p = urljoin(p, location)
+    # //{MAX_REDIRECTS + 1 hops were fetched and every answer was a redirect}
+    return "redirects", p, None
+
+
 def scan(url: str) -> Report:
     """
     REQUIRES: url is an absolute http or https URL as normalized by
        Result.normalize_result_fields(); HOSTMAP is loaded (init returned true).
     MODIFIES: CACHE, STAMP
     EFFECTS: If url is in CACHE and its entry is younger than CACHE_TTL, returns that
-       Report and fetches nothing. Else:
-       if the host of url is an IP literal in a loopback, link-local or private range,
-          returns Report(false, [], 0, "unsafe host") and caches it;
-       else if the GET of url (following redirects, FETCH_TIMEOUT seconds, reading at
-          most MAX_BYTES of body) times out, returns Report(false, [], 0, "timeout")
-          and caches it; if it cannot connect, the same with "connect";
-       else if the status is not 2xx, returns Report(false, [], 0, "http <status>") and
-          caches it; if the Content-Type is not HTML, the same with "not html";
-       else returns Report(true, T, |H|, "") and caches it, where
-          H = { host(s) : s is the src of a <script> or <iframe> tag in the body,
-                resolved against url, and registrable(host(s)) != registrable(host(url)) }
+       Report and fetches nothing. Else asks for the page with _fetch(url), which
+       follows at most MAX_REDIRECTS redirects and checks every hop, and:
+       if a hop is not an http or https URL or its host is unsafe (localhost, or an
+          address, or a name resolving to an address, that is loopback, private,
+          link-local, reserved, multicast or unspecified), returns
+          Report(false, [], 0, "unsafe host") and caches it; that hop is never fetched;
+       else if the page is still redirecting after MAX_REDIRECTS redirects, the same
+          with "redirects";
+       else if a GET times out (FETCH_TIMEOUT seconds per hop), the same with
+          "timeout"; if a host name does not resolve or a GET cannot connect, the
+          same with "connect";
+       else if the status of the last answer is not 2xx, returns
+          Report(false, [], 0, "http <status>") and caches it; if its Content-Type is
+          not HTML, the same with "not html";
+       else returns Report(true, T, |H|, "") and caches it, where p is the last hop
+          (the URL that answered), body is the first MAX_BYTES characters of the
+          answer's text, and
+          H = { host(s) : s is the src of a <script> or <iframe> tag in body,
+                resolved against p, and registrable(host(s)) != registrable(host(p)) }
           T = [ (h, o, c) : h in H, registrable(h) in HOSTMAP, (o, c) = HOSTMAP[registrable(h)] ]
                 ordered by h.
+       Any other failure returns Report(false, [], 0, "error"), caches it, and is
+       logged once with url.
+       MAX_BYTES bounds what is read out of the body, not the download: the whole
+       body is downloaded, and FETCH_TIMEOUT is the only bound on that.
        When CACHE is full the oldest entry is evicted first. Never raises: every
-       failure becomes a Report with fetched = false.
+       failure becomes a Report with fetched = false. (A failed assertion is not a
+       failure of the page. It means this module broke its own invariant, so it is
+       raised to be seen, and post_search reports that scan as "error".)
     IMPL SKETCH:
        if url in CACHE and age(CACHE[url]) < CACHE_TTL then return CACHE[url]
-       h := host(url)
-       if h is an ip literal and h is loopback or link-local or private then
-          r := Report(false, [], 0, "unsafe host")
+       (error, p, resp) := _fetch(url)
+          // Timeout gives r := Report(false, [], 0, "timeout"); a name that does not
+          // resolve or a connection error gives "connect"; any other exception gives
+          // "error" and is logged
+       if error != "" then r := Report(false, [], 0, error)
+       else if resp.status not in 2xx then r := Report(false, [], 0, "http " + status)
+       else if "html" notin resp.content_type then r := Report(false, [], 0, "not html")
        else
-          resp := searx.network.get(url, timeout := FETCH_TIMEOUT, allow_redirects := true,
-                                    raise_for_httperror := false)
-             // Timeout gives r := Report(false, [], 0, "timeout"); a connection error gives "connect"
-          if resp.status not in 2xx then r := Report(false, [], 0, "http " + status)
-          else if "html" notin resp.content_type then r := Report(false, [], 0, "not html")
-          else
-             body := first MAX_BYTES of resp.text
-             //{body is the head of an html page that answered 2xx}
-             H := { host of urljoin(url, src) : (script or iframe, src) in html.parser(body) }
-                  minus { x : registrable(x) = registrable(h) }
-             T := [ (x, HOSTMAP[registrable(x)]) : x in sorted(H) if registrable(x) in HOSTMAP ]
-             r := Report(true, T, |H|, "")
+          body := first MAX_BYTES characters of resp.text
+          //{body is the head of an html page that answered 2xx}
+          H := { host of urljoin(p, src) : (script or iframe, src) in html.parser(body) }
+               minus { x : registrable(x) = registrable(host(p)) }
+          T := [ (x, HOSTMAP[registrable(x)]) : x in sorted(H) if registrable(x) in HOSTMAP ]
+          r := Report(true, T, |H|, "")
        //{r.fetched implies (A (x,o,c) : (x,o,c) in r.trackers : (o,c) = HOSTMAP[registrable(x)])}
        with LOCK: CACHE[url] := r; while |CACHE| > CACHE_MAX evict the oldest entry
        return r
@@ -302,10 +377,10 @@ def scan(url: str) -> Report:
         _check_rep()
         return cached
     try:
-        if _unsafe(urlsplit(url).hostname or ""):
-            r = Report(False, [], 0, "unsafe host")
+        error, p, resp = _fetch(url)
+        if error:
+            r = Report(False, [], 0, error)
         else:
-            resp = searx.network.get(url, timeout=FETCH_TIMEOUT, allow_redirects=True, raise_for_httperror=False)
             content_type = resp.headers.get("content-type", "")
             if not 200 <= resp.status_code < 300:
                 r = Report(False, [], 0, f"http {resp.status_code}")
@@ -315,7 +390,7 @@ def scan(url: str) -> Report:
                 body = resp.text[:MAX_BYTES]
                 # //{body is the head of an html page that answered 2xx}
                 assert 200 <= resp.status_code < 300 and "html" in content_type.lower() and len(body) <= MAX_BYTES
-                hosts = _third_party_hosts(url, body)
+                hosts = _third_party_hosts(p, body)
                 trackers = [
                     (x, HOSTMAP[registrable(x)][0], HOSTMAP[registrable(x)][1])
                     for x in sorted(hosts)
@@ -324,10 +399,13 @@ def scan(url: str) -> Report:
                 r = Report(True, trackers, len(hosts), "")
     except searx.network.Timeout:
         r = Report(False, [], 0, "timeout")
+    except (CurlConnectionError, socket.gaierror):
+        r = Report(False, [], 0, "connect")
     except AssertionError:
         raise
-    except Exception:  # pylint: disable=broad-except
-        r = Report(False, [], 0, "connect")
+    except Exception as exc:  # pylint: disable=broad-except
+        log.error("tracker lens scan of %s failed: %r", url, exc)
+        r = Report(False, [], 0, "error")
     # //{r.fetched implies (A (x,o,c) : (x,o,c) in r.trackers : (o,c) = HOSTMAP[registrable(x)])}
     assert not r.fetched or all(list(HOSTMAP[registrable(x)]) == [o, c] for x, o, c in r.trackers)
     with LOCK:
@@ -384,17 +462,21 @@ class SXNGPlugin(Plugin):
         """
         MODIFIES: HOSTMAP, CACHE, STAMP, POOL, ACTIVE
         EFFECTS: If searx/data/tracker_radar_hosts.json cannot be read, cannot be
-           parsed, or holds no entries, logs the reason and returns false, so
-           PluginStorage removes the plugin and SearXNG runs exactly as before (no
-           badge, no panel, no fetch). Else sets HOSTMAP from the file, sets CACHE
-           empty, starts POOL with POOL_SIZE workers, and returns true.
+           parsed, holds no entries, or holds an entry whose value is not
+           [owner, categories] with owner a string and categories a list of strings,
+           logs the reason and returns false, so PluginStorage removes the plugin
+           and SearXNG runs exactly as before (no badge, no panel, no fetch). Else
+           sets HOSTMAP from the file, sets CACHE empty, starts POOL with POOL_SIZE
+           workers, and returns true.
            A missing list switches the lens off; it never runs with an empty map,
-           because an empty map would draw "no trackers found" on every card, and
-           that would be false.
+           because an empty map would draw "no known trackers in the page HTML" on
+           every card, and that would be false.
         IMPL SKETCH:
            try HOSTMAP := json.load(file) except (OSError, ValueError) as e: log(e); return false
+           if (E d : d in HOSTMAP : HOSTMAP[d] is not [string, list of strings]) then
+              log(d); return false
            if HOSTMAP = {} then log("empty host map"); return false
-           //{HOSTMAP != {}}
+           //{HOSTMAP != {} /\\ (A d : d in HOSTMAP : HOSTMAP[d] = [string, list of strings])}
            CACHE := {}; POOL := ThreadPoolExecutor(POOL_SIZE)
            return true
         HELPS: PluginStorage.init(app), called once when the web application starts
@@ -410,6 +492,15 @@ class SXNGPlugin(Plugin):
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise TypeError("not a JSON object")
+            for domain, value in data.items():
+                if not (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], str)
+                    and isinstance(value[1], list)
+                    and all(isinstance(c, str) for c in value[1])
+                ):
+                    raise TypeError(f"entry {domain!r} is not [owner, categories]")
             HOSTMAP.update(data)
         except (OSError, ValueError, TypeError) as exc:
             HOSTMAP.clear()
@@ -420,8 +511,8 @@ class SXNGPlugin(Plugin):
             self.log.error("tracker lens is off, host map %s: empty host map", HOSTMAP_FILE)
             _check_rep()
             return False
-        # //{HOSTMAP != {}}
-        assert HOSTMAP
+        # //{HOSTMAP != {} /\ (A d : d in HOSTMAP : HOSTMAP[d] = [string, list of strings])}
+        assert HOSTMAP and all(isinstance(o, str) and isinstance(c, list) for o, c in HOSTMAP.values())
         if POOL is not None:
             POOL.shutdown(wait=False)
         POOL = concurrent.futures.ThreadPoolExecutor(POOL_SIZE, thread_name_prefix="tracker_lens")
@@ -490,18 +581,24 @@ class SXNGPlugin(Plugin):
            url), returns None and changes nothing. Else waits until every scan in
            request.tracker_lens has finished or BUDGET seconds have passed since this
            call began, whichever comes first. Then, for each k in the table: if its
-           scan finished, request.tracker_lens[k] := that Report; if it is still
-           running, request.tracker_lens[k] := Report(false, [], 0, "timeout"), and the
-           scan is left to finish inside POOL so that CACHE is filled for the next
-           search. Returns None: adds no results. On return no Future remains in
-           the table.
+           scan finished and returned, request.tracker_lens[k] := that Report; if its
+           scan finished by raising (scan raises only a failed assertion),
+           request.tracker_lens[k] := Report(false, [], 0, "error") and the exception
+           is logged with k; if it is still running,
+           request.tracker_lens[k] := Report(false, [], 0, "timeout"), and the scan is
+           left to finish inside POOL so that CACHE is filled for the next search.
+           Returns None: adds no results. On return no Future remains in the table,
+           whatever the scans did.
         IMPL SKETCH:
            if request has no tracker_lens then return null
            deadline := now + BUDGET
            for (k, f) in request.tracker_lens:
               if f is a Future then
-                 if f finishes before deadline then request.tracker_lens[k] := f.result()
-                 else request.tracker_lens[k] := Report(false, [], 0, "timeout")
+                 if f has not finished by deadline then
+                    request.tracker_lens[k] := Report(false, [], 0, "timeout")
+                 else if f raised then
+                    log(k, the exception); request.tracker_lens[k] := Report(false, [], 0, "error")
+                 else request.tracker_lens[k] := f.result()
            //{(A k : k in request.tracker_lens : request.tracker_lens[k] is a Report)}
            return null
         HELPS: PluginStorage.post_search(request, search), which SearchWithPlugins.search
@@ -518,7 +615,13 @@ class SXNGPlugin(Plugin):
         with LOCK:
             for k, f in list(table.items()):
                 if isinstance(f, concurrent.futures.Future):
-                    table[k] = f.result() if f.done() else Report(False, [], 0, "timeout")
+                    if not f.done():
+                        table[k] = Report(False, [], 0, "timeout")
+                    elif f.exception() is not None:
+                        self.log.error("tracker lens scan of %s raised: %r", k, f.exception())
+                        table[k] = Report(False, [], 0, "error")
+                    else:
+                        table[k] = f.result()
             # //{(A k : k in request.tracker_lens : request.tracker_lens[k] is a Report)}
             assert all(isinstance(v, Report) for v in table.values())
         _check_rep(table)

@@ -60,7 +60,7 @@
   <details class="tracker_lens">
     <summary>
       {%- if not tl.fetched -%}{{ _('trackers: not checked') }}
-      {%- elif tl.trackers|length == 0 -%}{{ _('no trackers found') }}
+      {%- elif tl.trackers|length == 0 -%}{{ _('no known trackers in the page HTML') }}
       {%- else -%}{{ tl.trackers|length }} {{ _('trackers') }}{%- endif -%}
     </summary>
     {%- if tl.trackers -%}
