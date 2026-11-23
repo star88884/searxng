@@ -55,6 +55,7 @@ from searx import (
 )
 
 from searx.plugins.tracker_lens import site_trackers
+from searx.search_filter import filter_results
 from searx.tracker_graph import build_tracker_graph, format_for_cytoscape
 
 from searx import infopage
@@ -719,6 +720,16 @@ def search():
 
     results = result_container.get_ordered_results()
 
+    # User Rules / Filter: the rules arrive with the search, e.g. &max_trackers=2&blocked_hosts=a.com,b.com
+    # max_trackers counts only as 1 to 9 digits: int() raises on a string of more than 4300 digits.
+    max_trackers = sxng_request.form.get('max_trackers', '')
+    results, visible_reports = filter_results(
+        results,
+        sxng_request.form.get('blocked_hosts', '').split(','),
+        getattr(sxng_request, 'tracker_lens', {}),
+        int(max_trackers) if max_trackers.isdecimal() and len(max_trackers) < 10 else None,
+    )
+
     if search_query.redirect_to_first_result and results:
         return redirect(results[0]['url'], 302)
 
@@ -793,7 +804,7 @@ def search():
     flush=True
     )
     graph_data=build_tracker_graph(
-        site_trackers(getattr(sxng_request, "tracker_lens", {}))
+        site_trackers(visible_reports)
     )
     graph_data=format_for_cytoscape(graph_data)
     print("DEBUG Graph elements:", len(graph_data), flush=True)
