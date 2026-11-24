@@ -6,14 +6,14 @@ import { Plugin } from "../Plugin.ts";
 /**
  * OVERVIEW: Render the current search's website graph in the results page.
  *
- * Abstraction: this presentation adapter treats fetched Cytoscape elements as
+ * Abstraction: this presentation adapter treats embedded Cytoscape elements as
  * graph data; it does not compute shared trackers or collect website data.
- * Python builds/adapts sample data, the router loads this plugin on a click,
+ * Python builds the live graph, the router loads this plugin on a click,
  * and the results template supplies the button and rendering container.
  *
  * REQUIRES: The plugin loader and browser environment used by Plugin.
  * MODIFIES: Construction schedules the inherited Plugin lifecycle; run() owns
- * the fetch and rendering effects described below.
+ * the rendering effects described below.
  * EFFECTS: Register the trackerGraph plugin identity and render when run.
  * The inherited lifecycle logs failures. The data is the live graph that
  * webapp.py builds for this search and results.html embeds in the page;
