@@ -4,7 +4,7 @@ import cytoscape from "cytoscape";
 import { Plugin } from "../Plugin.ts";
 
 /**
- * OVERVIEW: Render the prototype's static website graph in the results page.
+ * OVERVIEW: Render the current search's website graph in the results page.
  *
  * Abstraction: this presentation adapter treats fetched Cytoscape elements as
  * graph data; it does not compute shared trackers or collect website data.
@@ -15,9 +15,9 @@ import { Plugin } from "../Plugin.ts";
  * MODIFIES: Construction schedules the inherited Plugin lifecycle; run() owns
  * the fetch and rendering effects described below.
  * EFFECTS: Register the trackerGraph plugin identity and render when run.
- * The inherited lifecycle logs failures. Future teammate integration would
- * provide data from tracker collection/search results; this implementation
- * always requests the static sample and has no live-data integration.
+ * The inherited lifecycle logs failures. The data is the live graph that
+ * webapp.py builds for this search and results.html embeds in the page;
+ * run() reads it from #tracker-graph-data and makes no network request.
  */
 export default class TrackerGraph extends Plugin {
     public constructor() {
@@ -26,17 +26,17 @@ export default class TrackerGraph extends Plugin {
     }
 
     /**
-     * OVERVIEW: Load sample elements and create the Cytoscape visualization.
+     * OVERVIEW: Read the embedded elements and create the Cytoscape visualization.
      * REQUIRES: If #tracker-graph exists, successful rendering needs a usable
-     * container and a successful JSON response containing Cytoscape elements at
-     * the static sample URL. No container is a supported no-op.
-     * MODIFIES: Issues a fetch request and lets Cytoscape manage the container
-     * and its rendering resources. Does not alter the server's sample file.
-     * EFFECTS: Return early without fetching if the container is absent;
-     * otherwise parse the sample and initialize Cytoscape with node/edge styles
-     * and the cose layout (layout animation disabled). Resolve without a value.
-     * Reject on a non-OK response, fetch/JSON failure, or initialization error;
-     * the inherited Plugin lifecycle catches and logs rejections.
+     * container and #tracker-graph-data holding Cytoscape elements as JSON text.
+     * No container is a supported no-op.
+     * MODIFIES: Lets Cytoscape manage the container and its rendering
+     * resources. Does not alter the embedded data.
+     * EFFECTS: Return early if the container is absent; throw if
+     * #tracker-graph-data is absent; otherwise parse it and initialize Cytoscape
+     * with node/edge styles and the cose layout (animation disabled). Resolve
+     * without a value. Reject on missing data, a JSON parse failure, or an
+     * initialization error; the inherited Plugin lifecycle catches and logs it.
      */
     protected async run():Promise<void> {
         const container =document.getElementById("tracker-graph"); // Searches the webpage for an HTML elemnt with that ID.
