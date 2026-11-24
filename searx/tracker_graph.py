@@ -13,9 +13,9 @@ EFFECTS: build_tracker_graph computes relationships; format_for_cytoscape adapts
     their representation without serializing or rendering them. The script
     serializes the first sample as Cytoscape elements for manual use.
 
-This prototype uses supplied/sample data and does not collect trackers or use
-live search results. Future teammate integration would supply those associations
-and connect graph output to the frontend; that pipeline is not implemented here.
+In the live search, webapp.py calls both functions with site_trackers() of the
+pages the filter kept; the template embeds the elements for TrackerGraph.ts.
+This module collects no trackers itself; the sample data is for the script run.
 """
 
 import json
